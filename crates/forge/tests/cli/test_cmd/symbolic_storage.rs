@@ -443,6 +443,49 @@ Suite result: FAILED. 0 passed; 2 failed; 0 skipped; [ELAPSED]
     assert!(!stdout.contains("symbolic Halmos compatibility cheatcode"), "{stdout}");
 }
 
+// Mapping reads through keys that the path forces equal address one slot, so their abstract base
+// values must agree; keys the path leaves distinct stay independent.
+#[forgetest_init]
+fn symbolic_storage_reads_through_equal_keys_agree(prj: _, cmd: _) {
+    skip_unless_z3!("symbolic_storage_reads_through_equal_keys_agree");
+
+    prj.add_test(
+        "SymbolicStorageKeyAliasing.t.sol",
+        r#"
+contract SymbolicStorageKeyAliasing {
+    mapping(address => uint256) balances;
+
+    /// forge-config: default.symbolic.storage_layout = "generic"
+    function checkEqualKeysReadEqualValues(uint256 a, uint256 b) public view {
+        require(a == b);
+        assert(balances[address(uint160(a))] == balances[address(uint160(b))]);
+    }
+
+    /// forge-config: default.symbolic.storage_layout = "generic"
+    function checkDistinctKeysMayDiffer(address a, address b) public view {
+        assert(balances[a] == balances[b]);
+    }
+}
+"#,
+    );
+
+    assert_symbolic(cmd.args([
+        "test",
+        "--symbolic",
+        "--match-contract",
+        "SymbolicStorageKeyAliasing",
+    ]))
+    .failure()
+    .stdout_eq(str![[r#"
+...
+Ran 2 tests for test/SymbolicStorageKeyAliasing.t.sol:SymbolicStorageKeyAliasing
+[FAIL: incomplete symbolic execution (Error): symbolic counterexample did not replay] checkDistinctKeysMayDiffer(address,address) ([METRICS])
+[PASS] checkEqualKeysReadEqualValues(uint256,uint256) ([METRICS])
+Suite result: FAILED. 1 passed; 1 failed; 0 skipped; [ELAPSED]
+...
+"#]]);
+}
+
 // Reading an unwritten mapping at a symbolic key must yield a fresh symbolic
 // value, not a concrete zero. The assertion below claims that no caller is an
 // admin; because nothing has ever written to `isAdmin`, the solver can satisfy

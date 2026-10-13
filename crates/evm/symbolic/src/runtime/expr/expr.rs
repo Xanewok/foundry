@@ -2044,7 +2044,7 @@ impl SymExpr {
                 out.push(')');
             }
             SymExprKind::BinOp(op, left, right) => {
-                let _ = write!(out, "({} ", op.smt());
+                let _ = write!(out, "({} ", op.smt_for(left, right));
                 left.write_smt(cx, out);
                 out.push(' ');
                 right.write_smt(cx, out);
@@ -2232,6 +2232,23 @@ pub(crate) enum SymBinOp {
 }
 
 impl SymBinOp {
+    /// Experiment: `FOUNDRY_SYMBOLIC_UF_NONLINEAR=1` abstracts non-constant products and quotients
+    /// as uninterpreted functions, an over-approximation: `unsat` stays valid, `sat` may be spurious.
+    pub(crate) fn smt_for(self, left: &SymExpr, right: &SymExpr) -> &'static str {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ON.get_or_init(|| std::env::var_os("FOUNDRY_SYMBOLIC_UF_NONLINEAR").is_some());
+        let both_symbolic = !matches!(left.kind(), SymExprKind::Const(_))
+            && !matches!(right.kind(), SymExprKind::Const(_));
+        match self {
+            Self::Mul if on && both_symbolic => "__uf_mul",
+            Self::UDiv if on && both_symbolic => "__uf_udiv",
+            Self::URem if on && both_symbolic => "__uf_urem",
+            Self::SDiv if on && both_symbolic => "__uf_sdiv",
+            Self::SRem if on && both_symbolic => "__uf_srem",
+            _ => self.smt(),
+        }
+    }
+
     pub(crate) const fn smt(self) -> &'static str {
         match self {
             Self::Add => "bvadd",

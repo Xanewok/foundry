@@ -281,7 +281,7 @@ impl SmtCseWriter<'_> {
                 out.push(')');
             }
             SymExprKind::BinOp(op, left, right) => {
-                let _ = write!(out, "({} ", op.smt());
+                let _ = write!(out, "({} ", op.smt_for(left, right));
                 self.write_expr(out, left, skip_expr, skip_bool);
                 out.push(' ');
                 self.write_expr(out, right, skip_expr, skip_bool);

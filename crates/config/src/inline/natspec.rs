@@ -133,8 +133,7 @@ impl NatSpec {
     pub fn halmos_config_values(&self) -> Result<Vec<String>, InlineConfigError> {
         let mut values = Vec::new();
         for line in self.docs.lines() {
-            let Some(idx) = line.find(HALMOS_CONFIG_PREFIX) else { continue };
-            let args = line[idx + HALMOS_CONFIG_PREFIX.len()..].trim();
+            let Some(args) = halmos_tag_args(line) else { continue };
             translate_halmos_config(args, &mut values).map_err(|message| InlineConfigError {
                 location: self.location_string(),
                 kind: InlineConfigErrorKind::InvalidHalmosConfig(message),
@@ -142,6 +141,15 @@ impl NatSpec {
         }
         Ok(values)
     }
+}
+
+/// Returns the arguments after a whole `@custom:halmos` tag. The tag name ends at whitespace or
+/// end of line, so `@custom:halmosoff` is a different tag and yields `None`.
+fn halmos_tag_args(line: &str) -> Option<&str> {
+    line.match_indices(HALMOS_CONFIG_PREFIX).find_map(|(idx, tag)| {
+        let rest = &line[idx + tag.len()..];
+        rest.chars().next().is_none_or(char::is_whitespace).then_some(rest.trim())
+    })
 }
 
 fn translate_halmos_config(args: &str, values: &mut Vec<String>) -> Result<(), String> {
@@ -183,6 +191,14 @@ enum HalmosArgParser {
     ArrayLengths,
     Lengths,
     U32,
+    /// Halmos `0` means unlimited, but Foundry `0` would allow no paths or steps.
+    U32ZeroUnlimited,
+    /// Halmos time option: `ms` by default, or an `ms`, `s`, `m`, `h` suffix. Converted to the
+    /// whole seconds of Foundry's `timeout`, rounding up so a nonzero value never becomes `0`
+    /// (no timeout).
+    TimeoutSeconds,
+    /// Halmos option with no Foundry equivalent; skipped with a warning.
+    Unsupported,
     String,
 }
 
@@ -208,17 +224,28 @@ const HALMOS_ARGS: &[HalmosArg] = &[
         parser: HalmosArgParser::U32,
         foundry_field: "invariant_depth",
     },
-    HalmosArg { flag: "--width", parser: HalmosArgParser::U32, foundry_field: "width" },
-    HalmosArg { flag: "--depth", parser: HalmosArgParser::U32, foundry_field: "depth" },
-    HalmosArg { flag: "--solver-timeout", parser: HalmosArgParser::U32, foundry_field: "timeout" },
+    HalmosArg {
+        flag: "--width",
+        parser: HalmosArgParser::U32ZeroUnlimited,
+        foundry_field: "width",
+    },
+    HalmosArg {
+        flag: "--depth",
+        parser: HalmosArgParser::U32ZeroUnlimited,
+        foundry_field: "depth",
+    },
+    // Halmos has no `--solver-timeout`; argparse rejects it as ambiguous between the two below.
+    //
+    // Branching is a per-branch-condition budget (Halmos default 1ms), unrelated to Foundry's
+    // `timeout`, which bounds each solver query and the symbolic run.
     HalmosArg {
         flag: "--solver-timeout-branching",
-        parser: HalmosArgParser::U32,
-        foundry_field: "timeout",
+        parser: HalmosArgParser::Unsupported,
+        foundry_field: "",
     },
     HalmosArg {
         flag: "--solver-timeout-assertion",
-        parser: HalmosArgParser::U32,
+        parser: HalmosArgParser::TimeoutSeconds,
         foundry_field: "timeout",
     },
     HalmosArg { flag: "--solver", parser: HalmosArgParser::String, foundry_field: "solver" },
@@ -246,11 +273,48 @@ fn emit_halmos_arg(values: &mut Vec<String>, arg: HalmosArg, value: &str) -> Res
             values.push(format!("default.symbolic.{} = {value}", arg.foundry_field));
             Ok(())
         }
+        HalmosArgParser::U32ZeroUnlimited => {
+            let value = value
+                .parse::<u32>()
+                .map_err(|_| format!("invalid value `{value}` for {}", arg.flag))?;
+            let value = if value == 0 { u32::MAX } else { value };
+            values.push(format!("default.symbolic.{} = {value}", arg.foundry_field));
+            Ok(())
+        }
+        HalmosArgParser::TimeoutSeconds => {
+            let seconds = parse_halmos_timeout_seconds(value)
+                .ok_or_else(|| format!("invalid value `{value}` for {}", arg.flag))?;
+            values.push(format!("default.symbolic.{} = {seconds}", arg.foundry_field));
+            Ok(())
+        }
+        HalmosArgParser::Unsupported => {
+            warn!(
+                flag = arg.flag,
+                value, "ignoring @custom:halmos option with no Foundry equivalent"
+            );
+            Ok(())
+        }
         HalmosArgParser::String => {
             values.push(format!("default.symbolic.{} = {}", arg.foundry_field, toml_string(value)));
             Ok(())
         }
     }
+}
+
+fn parse_halmos_timeout_seconds(value: &str) -> Option<u32> {
+    let (number, millis_per_unit) = if let Some(n) = value.strip_suffix("ms") {
+        (n, 1u64)
+    } else if let Some(n) = value.strip_suffix('s') {
+        (n, 1_000)
+    } else if let Some(n) = value.strip_suffix('m') {
+        (n, 60_000)
+    } else if let Some(n) = value.strip_suffix('h') {
+        (n, 3_600_000)
+    } else {
+        (value, 1)
+    };
+    let millis = number.parse::<u64>().ok()?.checked_mul(millis_per_unit)?;
+    Some(millis.div_ceil(1_000).min(u32::MAX as u64) as u32)
 }
 
 fn push_halmos_array_lengths(values: &mut Vec<String>, value: &str) -> Result<(), String> {
@@ -932,12 +996,92 @@ contract FuzzInlineConf is DSTest {
     }
 
     #[test]
+    fn halmos_tag_must_match_whole_tag() {
+        let natspec = |docs: &str| NatSpec {
+            contract: "dir/TestContract.t.sol:SymbolicContract".to_string(),
+            function: Some("check_tag".to_string()),
+            line: "10:1".to_string(),
+            docs: docs.to_string(),
+        };
+
+        for docs in ["@custom:halmosoff --loop 5", "@custom:halmos-note --loop 5"] {
+            assert!(natspec(docs).halmos_config_values().unwrap().is_empty(), "{docs}");
+        }
+        assert_eq!(
+            natspec("@custom:halmosoff --loop 5\n@custom:halmos --loop 7\t--depth 3")
+                .halmos_config_values()
+                .unwrap(),
+            vec!["default.symbolic.loop = 7", "default.symbolic.depth = 3"]
+        );
+        assert!(natspec("@custom:halmos").halmos_config_values().unwrap().is_empty());
+    }
+
+    #[test]
+    fn halmos_zero_width_and_depth_are_unlimited() {
+        let natspec = NatSpec {
+            contract: "dir/TestContract.t.sol:SymbolicContract".to_string(),
+            function: Some("check_unlimited".to_string()),
+            line: "10:1".to_string(),
+            docs: "@custom:halmos --width 0 --depth=0".to_string(),
+        };
+
+        assert_eq!(
+            natspec.halmos_config_values().unwrap(),
+            vec!["default.symbolic.width = 4294967295", "default.symbolic.depth = 4294967295"]
+        );
+    }
+
+    #[test]
+    fn halmos_solver_timeout_assertion_converts_to_seconds() {
+        let translate = |value: &str| {
+            let natspec = NatSpec {
+                contract: "dir/TestContract.t.sol:SymbolicContract".to_string(),
+                function: Some("check_timeout".to_string()),
+                line: "10:1".to_string(),
+                docs: format!("@custom:halmos --solver-timeout-assertion {value}"),
+            };
+            natspec.halmos_config_values()
+        };
+
+        for (value, seconds) in [
+            ("0", 0),
+            ("1", 1),
+            ("1000", 1),
+            ("1001", 2),
+            ("200ms", 1),
+            ("5s", 5),
+            ("2m", 120),
+            ("1h", 3600),
+        ] {
+            assert_eq!(
+                translate(value).unwrap(),
+                vec![format!("default.symbolic.timeout = {seconds}")]
+            );
+        }
+        assert!(translate("fast").is_err());
+        assert!(translate("1.5s").is_err());
+    }
+
+    #[test]
+    fn halmos_solver_timeout_branching_is_not_the_run_timeout() {
+        let natspec = NatSpec {
+            contract: "dir/TestContract.t.sol:SymbolicContract".to_string(),
+            function: Some("check_timeout".to_string()),
+            line: "10:1".to_string(),
+            docs: "@custom:halmos --solver-timeout-branching 1000 --solver-timeout 7 --loop 3"
+                .to_string(),
+        };
+
+        assert_eq!(natspec.halmos_config_values().unwrap(), vec!["default.symbolic.loop = 3"]);
+    }
+
+    #[test]
     fn translates_legacy_halmos_width_depth_and_solver_timeout() {
         let natspec = NatSpec {
             contract: "dir/TestContract.t.sol:SymbolicContract".to_string(),
             function: Some("invariant_state".to_string()),
             line: "10:1".to_string(),
-            docs: "@custom:halmos --width=32 --depth 128 --solver-timeout-branching 5".to_string(),
+            docs: "@custom:halmos --width=32 --depth 128 --solver-timeout-assertion 5s".to_string(),
         };
 
         assert_eq!(

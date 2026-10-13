@@ -545,3 +545,51 @@ Tip: Run `forge test --rerun` to retry only the 1 failed test
 
 "#]]);
 }
+
+const UF_REFINE_SOURCE: &str = r#"
+contract SymbolicUfRefine {
+    function checkProductBound(uint256 a, uint256 b) public pure {
+        require(a <= 1 && b <= 1);
+        assert(a * b <= 1);
+    }
+
+    function checkProductIsZero(uint256 a, uint256 b) public pure {
+        require(a <= 1 && b <= 1);
+        assert(a * b == 0);
+    }
+}
+"#;
+
+// The abstraction alone admits a model with `a * b == 7`; refinement must rule it out.
+#[forgetest_init]
+fn symbolic_uf_refinement_proves_spuriously_failing_property(prj: _, cmd: _) {
+    skip_unless_z3!("symbolic_uf_refinement_proves_spuriously_failing_property");
+
+    prj.add_test("SymbolicUfRefine.t.sol", UF_REFINE_SOURCE);
+    cmd.env("FOUNDRY_SYMBOLIC_UF_NONLINEAR", "1");
+
+    assert_symbolic(cmd.args(["test", "--symbolic", "--match-test", "checkProductBound"]))
+        .success()
+        .stdout_eq(str![[r#"
+...
+[PASS] checkProductBound(uint256,uint256) ([METRICS])
+...
+"#]]);
+}
+
+// Refinement must keep a genuine model: `a = b = 1` really fails.
+#[forgetest_init]
+fn symbolic_uf_refinement_keeps_genuine_counterexample(prj: _, cmd: _) {
+    skip_unless_z3!("symbolic_uf_refinement_keeps_genuine_counterexample");
+
+    prj.add_test("SymbolicUfRefine.t.sol", UF_REFINE_SOURCE);
+    cmd.env("FOUNDRY_SYMBOLIC_UF_NONLINEAR", "1");
+
+    assert_symbolic_witness(cmd.args(["test", "--symbolic", "--match-test", "checkProductIsZero"]))
+        .failure()
+        .stdout_eq(str![[r#"
+...
+[FAIL: panic: assertion failed (0x01); counterexample: 		[SENDER] [SENDER] [CALLDATA] [ARGS]] checkProductIsZero(uint256,uint256) ([METRICS])
+...
+"#]]);
+}

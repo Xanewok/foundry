@@ -2219,6 +2219,11 @@ impl SymTernOp {
     }
 }
 
+pub(crate) fn uf_nonlinear_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FOUNDRY_SYMBOLIC_UF_NONLINEAR").is_some())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum SymBinOp {
     Add,
@@ -2240,18 +2245,29 @@ impl SymBinOp {
     /// Experiment: `FOUNDRY_SYMBOLIC_UF_NONLINEAR=1` abstracts non-constant products and quotients
     /// as uninterpreted functions, an over-approximation: `unsat` stays valid, `sat` may be spurious.
     pub(crate) fn smt_for(self, left: &SymExpr, right: &SymExpr) -> &'static str {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let on = *ON.get_or_init(|| std::env::var_os("FOUNDRY_SYMBOLIC_UF_NONLINEAR").is_some());
-        let both_symbolic = !matches!(left.kind(), SymExprKind::Const(_))
-            && !matches!(right.kind(), SymExprKind::Const(_));
-        match self {
-            Self::Mul if on && both_symbolic => "__uf_mul",
-            Self::UDiv if on && both_symbolic => "__uf_udiv",
-            Self::URem if on && both_symbolic => "__uf_urem",
-            Self::SDiv if on && both_symbolic => "__uf_sdiv",
-            Self::SRem if on && both_symbolic => "__uf_srem",
+        match self.uf_name() {
+            Some(name) if uf_nonlinear_enabled() && self.abstracts(left, right) => name,
             _ => self.smt(),
         }
+    }
+
+    /// The uninterpreted function standing in for this operator when it is abstracted.
+    pub(crate) const fn uf_name(self) -> Option<&'static str> {
+        match self {
+            Self::Mul => Some("__uf_mul"),
+            Self::UDiv => Some("__uf_udiv"),
+            Self::URem => Some("__uf_urem"),
+            Self::SDiv => Some("__uf_sdiv"),
+            Self::SRem => Some("__uf_srem"),
+            _ => None,
+        }
+    }
+
+    /// Whether the abstraction replaces this operator over these operands, ignoring the flag.
+    pub(crate) fn abstracts(self, left: &SymExpr, right: &SymExpr) -> bool {
+        self.uf_name().is_some()
+            && !matches!(left.kind(), SymExprKind::Const(_))
+            && !matches!(right.kind(), SymExprKind::Const(_))
     }
 
     pub(crate) const fn smt(self) -> &'static str {

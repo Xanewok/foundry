@@ -101,6 +101,14 @@ pub(crate) struct SolverCommand {
 }
 
 impl SolverCommand {
+    /// Whether the command is a plain bitwuzla, which keeps `push`/`pop` state across `check-sat`s
+    /// without an extra option (bitwuzla 0.8.1 has no `--incremental` flag; checked empirically).
+    fn supports_incremental(&self) -> bool {
+        std::path::Path::new(&self.program).file_name().and_then(|name| name.to_str())
+            == Some("bitwuzla")
+            && !self.args.iter().any(|arg| arg.starts_with("--abstraction"))
+    }
+
     /// Constructs a solver command from a program plus arguments.
     pub(crate) fn new(parts: Vec<String>, smt_timeout: bool) -> Result<Self, SolverConfigError> {
         let mut parts = parts.into_iter();
@@ -139,6 +147,8 @@ pub(crate) struct SmtLibSubprocessSolver {
     smt_build_time: Duration,
     smt_max_query_time: Duration,
     z3_session: Option<Z3Session>,
+    incremental: bool,
+    incremental_session: Option<IncrementalSession>,
     last_query_uf: bool,
 }
 
@@ -168,6 +178,9 @@ impl SmtLibSubprocessSolver {
             smt_build_time: Duration::ZERO,
             smt_max_query_time: Duration::ZERO,
             z3_session: None,
+            incremental: std::env::var_os("FOUNDRY_SYMBOLIC_INCREMENTAL")
+                .is_some_and(|value| value == "1"),
+            incremental_session: None,
             last_query_uf: false,
         }
     }
@@ -200,6 +213,8 @@ impl SmtLibSubprocessSolver {
         self.normalization_cache.clear();
         self.sat_cache.clear();
         self.model_cache.clear();
+        // Session symbols are ids of the previous context and may be reused by the next one.
+        self.incremental_session = None;
     }
 
     /// Verifies that a configured solver can be invoked before exploration starts.
@@ -611,12 +626,9 @@ impl SmtLibSubprocessSolver {
         write_smt_assertions(cx, &mut smt, smt_constraints)?;
         self.last_query_uf = smt.contains("(__uf_");
         if self.last_query_uf {
-            let decls = ["mul", "udiv", "urem", "sdiv", "srem"].map(|op| {
-                format!("(declare-fun __uf_{op} ((_ BitVec 256) (_ BitVec 256)) (_ BitVec 256))\n")
-            });
             smt = smt.replacen(
                 "(set-logic QF_BV)\n",
-                &format!("(set-logic QF_UFBV)\n{}", decls.concat()),
+                &format!("(set-logic QF_UFBV)\n{}", uf_declarations()),
                 1,
             );
         }
@@ -641,6 +653,13 @@ impl SmtLibSubprocessSolver {
         {
             let output = self.query_z3(command, &smt).into_result();
             SolverCommandRun { output, summaries: Vec::new() }
+        } else if self.incremental
+            && let [command] = commands.as_slice()
+            && command.supports_incremental()
+        {
+            let output =
+                self.query_incremental(cx, command, &smt, smt_constraints, model).into_result();
+            SolverCommandRun { output, summaries: Vec::new() }
         } else {
             run_solver_commands(
                 cx,
@@ -664,6 +683,43 @@ impl SmtLibSubprocessSolver {
         result.output
     }
 
+    /// Answers a query on the long-lived incremental session, reusing the asserted common prefix.
+    ///
+    /// Contract: the session is kept only after a verdict; every other outcome drops it, so a
+    /// stale assertion stack can never answer a later query. Protocol failures re-run the query
+    /// one-shot on the full `smt`.
+    fn query_incremental(
+        &mut self,
+        cx: &SymCx,
+        command: &SolverCommand,
+        smt: &str,
+        constraints: &[SymBoolExpr],
+        model: bool,
+    ) -> SolverProcessOutcome {
+        let mut session = match self.incremental_session.take() {
+            Some(session) => session,
+            None => match IncrementalSession::spawn(command) {
+                Ok(session) => session,
+                Err(err) => {
+                    debug!(error = %err, "incremental solver spawn failed; using one-shot query");
+                    return run_solver_process(command, smt, self.timeout, &AtomicBool::new(false));
+                }
+            },
+        };
+        match session.run(command, cx, constraints, model, self.timeout) {
+            output @ SolverProcessOutcome::Output(_) => {
+                self.incremental_session = Some(session);
+                output
+            }
+            SolverProcessOutcome::Error(err) => {
+                drop(session);
+                debug!(error = %err, "incremental solver query failed; using one-shot query");
+                run_solver_process(command, smt, self.timeout, &AtomicBool::new(false))
+            }
+            other => other,
+        }
+    }
+
     fn query_z3(&mut self, command: &SolverCommand, smt: &str) -> SolverProcessOutcome {
         let mut session = match self.z3_session.take() {
             Some(session) => session,
@@ -685,6 +741,20 @@ impl SmtLibSubprocessSolver {
             other => other,
         }
     }
+}
+
+/// Returns the declarations of the uninterpreted functions that abstract nonlinear operators.
+fn uf_declarations() -> String {
+    ["mul", "udiv", "urem", "sdiv", "srem"]
+        .map(|op| {
+            format!("(declare-fun __uf_{op} ((_ BitVec 256) (_ BitVec 256)) (_ BitVec 256))\n")
+        })
+        .concat()
+}
+
+/// Returns the length of the longest common prefix of `a` and `b`.
+fn common_prefix_len<T: PartialEq>(a: &[T], b: &[T]) -> usize {
+    a.iter().zip(b).take_while(|(left, right)| left == right).count()
 }
 
 /// Prepends the application axioms, keeping the last constraint last for branch-complement checks.
@@ -1472,7 +1542,32 @@ impl Z3Session {
         {
             return SolverProcessOutcome::Error(format!("failed to write solver query: {err}"));
         }
+        self.read_response(command, timeout)
+    }
 
+    /// Sends `script` followed by the end marker, without resetting the solver.
+    fn query_script(
+        &mut self,
+        command: &SolverCommand,
+        script: &str,
+        timeout: Option<u32>,
+    ) -> SolverProcessOutcome {
+        if let Err(err) = self
+            .stdin
+            .write_all(script.as_bytes())
+            .and_then(|_| writeln!(self.stdin, "(echo \"{Z3_QUERY_END}\")"))
+            .and_then(|_| self.stdin.flush())
+        {
+            return SolverProcessOutcome::Error(format!("failed to write solver query: {err}"));
+        }
+        self.read_response(command, timeout)
+    }
+
+    fn read_response(
+        &mut self,
+        command: &SolverCommand,
+        timeout: Option<u32>,
+    ) -> SolverProcessOutcome {
         let started_at = Instant::now();
         let timeout = timeout
             .filter(|seconds| *seconds > 0)
@@ -1483,7 +1578,8 @@ impl Z3Session {
                 return SolverProcessOutcome::Unknown;
             };
             match self.stdout.recv_timeout(wait) {
-                Ok(Ok(line)) if line == Z3_QUERY_END => {
+                // bitwuzla prints `echo` arguments quoted; z3 prints them bare.
+                Ok(Ok(line)) if line.trim_matches('"') == Z3_QUERY_END => {
                     return SolverProcessOutcome::Output(output);
                 }
                 Ok(Ok(line)) => {
@@ -1509,6 +1605,124 @@ impl Z3Session {
                 }
             }
         }
+    }
+}
+
+/// A long-lived solver whose assertion stack holds one `push` level per entry of `constraints`.
+///
+/// Invariants: `frame_symbols[i]` are the symbols declared inside level `i + 1`, and `declared` is
+/// their union, so declarations disappear exactly when their level is popped. Any failure
+/// makes the owner drop the session, because the stacks may then disagree with the solver.
+struct IncrementalSession {
+    session: Z3Session,
+    constraints: Vec<SymBoolExpr>,
+    frame_symbols: Vec<Vec<Symbol>>,
+    declared: HashSet<Symbol>,
+    /// Makes CSE binding names unique across live levels; never reused within a session.
+    next_tag: usize,
+}
+
+impl IncrementalSession {
+    fn spawn(command: &SolverCommand) -> Result<Self, String> {
+        let mut session = Z3Session::spawn(command)?;
+        // One logic for both plain and UF queries; the UF symbols live at level 0 for good.
+        let preamble = format!("(set-logic QF_UFBV)\n{}", uf_declarations());
+        session
+            .stdin
+            .write_all(preamble.as_bytes())
+            .and_then(|()| session.stdin.flush())
+            .map_err(|err| format!("failed to write solver preamble: {err}"))?;
+        Ok(Self {
+            session,
+            constraints: Vec::new(),
+            frame_symbols: Vec::new(),
+            declared: HashSet::default(),
+            next_tag: 0,
+        })
+    }
+
+    fn run(
+        &mut self,
+        command: &SolverCommand,
+        cx: &SymCx,
+        constraints: &[SymBoolExpr],
+        model: bool,
+        timeout: Option<u32>,
+    ) -> SolverProcessOutcome {
+        let script = match self.script(cx, constraints, model) {
+            Ok(script) => script,
+            Err(err) => return SolverProcessOutcome::Error(err),
+        };
+        match self.session.query_script(command, &script, timeout) {
+            SolverProcessOutcome::Output(output) => {
+                // A rejected command would otherwise leave the stacks silently out of sync.
+                if matches!(output.lines().next().map(str::trim), Some("sat" | "unsat" | "unknown"))
+                {
+                    SolverProcessOutcome::Output(output)
+                } else {
+                    SolverProcessOutcome::Error(format!(
+                        "unexpected incremental solver response `{}`",
+                        output.trim()
+                    ))
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// Pops to the longest common prefix, then pushes one level per remaining constraint.
+    ///
+    /// Updates the stacks eagerly: the caller must drop the session if the script is not answered.
+    fn script(
+        &mut self,
+        cx: &SymCx,
+        constraints: &[SymBoolExpr],
+        model: bool,
+    ) -> Result<String, String> {
+        let keep = common_prefix_len(&self.constraints, constraints);
+        let mut script = String::new();
+        if self.constraints.len() > keep {
+            let _ = writeln!(script, "(pop {})", self.constraints.len() - keep);
+        }
+        for symbols in self.frame_symbols.drain(keep..) {
+            for symbol in symbols {
+                self.declared.remove(&symbol);
+            }
+        }
+        self.constraints.truncate(keep);
+
+        for constraint in &constraints[keep..] {
+            let tag = self.next_tag;
+            self.next_tag += 1;
+            script.push_str("(push 1)\n");
+
+            let mut vars = SymbolicVars::default();
+            constraint.collect_vars(&mut vars);
+            let mut fresh = Vec::new();
+            for var in vars {
+                if self.declared.insert(var) {
+                    let name = cx.symbol_name(var);
+                    if name.contains("__sym_") {
+                        return Err(format!("symbol `{name}` collides with CSE binding names"));
+                    }
+                    let _ = writeln!(script, "(declare-fun {name} () (_ BitVec 256))");
+                    fresh.push(var);
+                }
+            }
+
+            let mut assertion = String::new();
+            write_smt_assertions(cx, &mut assertion, std::slice::from_ref(constraint))
+                .map_err(|err| err.to_string())?;
+            script.push_str(&assertion.replace("__sym_", &format!("__sym{tag}_")));
+            self.constraints.push(constraint.clone());
+            self.frame_symbols.push(fresh);
+        }
+
+        script.push_str("(check-sat)\n");
+        if model {
+            script.push_str("(get-model)\n");
+        }
+        Ok(script)
     }
 }
 
@@ -1770,4 +1984,20 @@ fn model_symbols_for_constraints(
         constraint.collect_vars(&mut vars);
     }
     vars.into_iter().map(|symbol| (cx.symbol_name(symbol).to_owned(), symbol)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::common_prefix_len;
+
+    #[test]
+    fn common_prefix_len_stops_at_first_difference() {
+        assert_eq!(common_prefix_len::<u8>(&[], &[]), 0);
+        assert_eq!(common_prefix_len(&[1, 2, 3], &[]), 0);
+        assert_eq!(common_prefix_len(&[1, 2, 3], &[1, 2, 3]), 3);
+        assert_eq!(common_prefix_len(&[1, 2, 3], &[1, 2]), 2);
+        assert_eq!(common_prefix_len(&[1, 2, 3], &[1, 2, 4, 3]), 2);
+        assert_eq!(common_prefix_len(&[1, 2], &[2, 1]), 0);
+        assert_eq!(common_prefix_len(&[1, 2, 3], &[1, 9, 3]), 1);
+    }
 }

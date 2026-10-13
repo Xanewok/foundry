@@ -11,12 +11,14 @@ use wait_timeout::ChildExt;
 
 mod congruence;
 mod fallback;
+mod narrow;
 mod normalize;
 mod reasoning;
 mod smt;
 
 use congruence::application_congruence;
 use fallback::{checked_mul_guard_branch_model, constraints_prefer_hard_arith_fallback_first};
+use narrow::{is_implied_by_width, narrow_enabled, narrow_widths, write_declaration};
 use normalize::{
     constraints_are_directly_unsat, normalize_constraints_for_solver_cached,
     sorted_bool_exprs_are_subset,
@@ -604,11 +606,20 @@ impl SmtLibSubprocessSolver {
         {
             let _ = writeln!(smt, "(set-option :timeout {})", timeout.saturating_mul(1000));
         }
+        let widths = narrow_widths(narrow_enabled(), smt_constraints);
         for var in vars {
-            let name = cx.symbol_name(var);
-            let _ = writeln!(smt, "(declare-fun {name} () (_ BitVec 256))");
+            write_declaration(&mut smt, cx.symbol_name(var), widths.get(&var).copied());
         }
-        write_smt_assertions(cx, &mut smt, smt_constraints)?;
+        if widths.is_empty() {
+            write_smt_assertions(cx, &mut smt, smt_constraints)?;
+        } else {
+            let kept = smt_constraints
+                .iter()
+                .filter(|constraint| !is_implied_by_width(&widths, constraint))
+                .cloned()
+                .collect::<Vec<_>>();
+            write_smt_assertions(cx, &mut smt, &kept)?;
+        }
         self.last_query_uf = smt.contains("(__uf_");
         if self.last_query_uf {
             let decls = ["mul", "udiv", "urem", "sdiv", "srem"].map(|op| {
@@ -1718,7 +1729,7 @@ fn parse_model_values(
                 while tokens.next_if(|token| *token != "define-fun").is_some() {}
                 continue;
             }
-            while let Some(value) = tokens.next() {
+            while let Some(value) = tokens.next_if(|token| *token != "define-fun") {
                 if let Some(hex) = value.strip_prefix("#x") {
                     if hex.len() > 64 {
                         return Err(SymbolicError::Solver(
@@ -1765,9 +1776,27 @@ fn model_symbols_for_constraints(
     cx: &SymCx,
     constraints: &[SymBoolExpr],
 ) -> HashMap<String, Symbol> {
+    model_symbols_with_narrow(cx, constraints, narrow_enabled())
+}
+
+/// Narrow symbols appear in models only as `{name}__n`; the alias recovers the 256-bit value,
+/// which parses zero-extended because model values are read as unsigned.
+fn model_symbols_with_narrow(
+    cx: &SymCx,
+    constraints: &[SymBoolExpr],
+    narrow: bool,
+) -> HashMap<String, Symbol> {
     let mut vars = SymbolicVars::default();
     for constraint in constraints {
         constraint.collect_vars(&mut vars);
     }
-    vars.into_iter().map(|symbol| (cx.symbol_name(symbol).to_owned(), symbol)).collect()
+    let mut symbols = HashMap::default();
+    for symbol in vars {
+        let name = cx.symbol_name(symbol);
+        if narrow {
+            symbols.insert(format!("{name}{}", narrow::NARROW_SUFFIX), symbol);
+        }
+        symbols.insert(name.to_owned(), symbol);
+    }
+    symbols
 }

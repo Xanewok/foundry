@@ -1462,6 +1462,13 @@ impl SymExpr {
     }
 
     pub(crate) fn collect_eval_vars(&self, vars: &mut SymbolicVars) {
+        if unique_var_walk() {
+            self.visit_bool(|expr| {
+                vars.extend(expr.kind().get_eval_var());
+                false
+            });
+            return;
+        }
         let _ = self.visit(&mut |expr| {
             if let Some(var) = expr.kind().get_eval_var() {
                 vars.insert(var);

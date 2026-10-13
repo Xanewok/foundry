@@ -762,19 +762,28 @@ impl SymBoolExpr {
     }
 
     pub(crate) fn collect_vars(&self, vars: &mut SymbolicVars) {
-        let _ = self.visit_exprs(&mut |expr| {
-            if let Some(var) = expr.kind().get_var() {
-                vars.insert(var);
-            }
-            ControlFlow::<()>::Continue(())
-        });
+        self.collect_matching(vars, SymExprKind::get_var, unique_var_walk());
     }
 
     pub(crate) fn collect_eval_vars(&self, vars: &mut SymbolicVars) {
+        self.collect_matching(vars, SymExprKind::get_eval_var, unique_var_walk());
+    }
+
+    fn collect_matching(
+        &self,
+        vars: &mut SymbolicVars,
+        pick: fn(&SymExprKind) -> Option<Symbol>,
+        unique: bool,
+    ) {
+        if unique {
+            visit_unique(vec![self.clone()], Vec::new(), |expr| {
+                vars.extend(pick(expr.kind()));
+                false
+            });
+            return;
+        }
         let _ = self.visit_exprs(&mut |expr| {
-            if let Some(var) = expr.kind().get_eval_var() {
-                vars.insert(var);
-            }
+            vars.extend(pick(expr.kind()));
             ControlFlow::<()>::Continue(())
         });
     }
@@ -849,6 +858,16 @@ impl SymCmpOp {
     }
 }
 
+/// Whether variable collection walks each distinct node once instead of each occurrence.
+///
+/// Contract: unset keeps the tree walk. A tree walk revisits a shared subexpression once per
+/// occurrence, so its cost multiplies at every level of nested hashes (an ECDSA digest is three
+/// levels deep) and it runs on every solver query.
+pub(crate) fn unique_var_walk() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FOUNDRY_SYMBOLIC_VISIT_UNIQUE").is_some())
+}
+
 /// Returns whether any word node reachable from the pending expressions satisfies `visitor`.
 ///
 /// Expressions are hash-consed DAGs, so each distinct node is visited once. A tree walk would
@@ -912,5 +931,53 @@ pub(crate) fn visit_unique(
                 pending_words.push(right.clone());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A chain of `depth` hashes, each over `width` copies of the previous one.
+    fn nested_hashes(cx: &mut SymCx, depth: usize, width: usize) -> SymExpr {
+        let mut hash = SymExpr::var(cx, "x");
+        for _ in 0..depth {
+            hash = keccak_word(cx, vec![hash; width]);
+        }
+        hash
+    }
+
+    #[test]
+    fn unique_walk_collects_the_vars_of_the_tree_walk() {
+        let mut cx = SymCx::new();
+        let hash = nested_hashes(&mut cx, 4, 6);
+        let y = SymExpr::var(&mut cx, "y");
+        let constraint = SymBoolExpr::eq(&mut cx, hash, y);
+
+        let (mut tree, mut unique) = (SymbolicVars::default(), SymbolicVars::default());
+        constraint.collect_matching(&mut tree, SymExprKind::get_var, false);
+        constraint.collect_matching(&mut unique, SymExprKind::get_var, true);
+        assert_eq!(tree, unique);
+        // `x`, `y` and the four hashes.
+        assert_eq!(unique.len(), 6);
+
+        let (mut tree, mut unique) = (SymbolicVars::default(), SymbolicVars::default());
+        constraint.collect_matching(&mut tree, SymExprKind::get_eval_var, false);
+        constraint.collect_matching(&mut unique, SymExprKind::get_eval_var, true);
+        assert_eq!(tree, unique);
+        assert_eq!(unique.len(), 2);
+    }
+
+    #[test]
+    fn unique_walk_is_linear_in_distinct_nodes() {
+        let mut cx = SymCx::new();
+        // 40^8 occurrences of `x` in the tree.
+        let hash = nested_hashes(&mut cx, 8, 40);
+        let y = SymExpr::var(&mut cx, "y");
+        let constraint = SymBoolExpr::eq(&mut cx, hash, y);
+
+        let mut vars = SymbolicVars::default();
+        constraint.collect_matching(&mut vars, SymExprKind::get_var, true);
+        assert_eq!(vars.len(), 10);
     }
 }

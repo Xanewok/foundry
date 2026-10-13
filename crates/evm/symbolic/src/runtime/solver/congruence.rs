@@ -28,6 +28,13 @@ pub(super) fn application_congruence(
             continue;
         }
         for input in inputs.iter() {
+            if unique_var_walk() {
+                input.visit_bool(|expr| {
+                    pending.extend(expr.kind().get_var());
+                    false
+                });
+                continue;
+            }
             let _ = input.visit(&mut |expr| {
                 pending.extend(expr.kind().get_var());
                 ControlFlow::<()>::Continue(())

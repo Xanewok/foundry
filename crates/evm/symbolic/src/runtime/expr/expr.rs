@@ -2034,6 +2034,12 @@ impl SymExpr {
         expr
     }
 
+    pub(crate) fn smt(&self, cx: &SymCx) -> String {
+        let mut smt = String::new();
+        self.write_smt(cx, &mut smt);
+        smt
+    }
+
     pub(in crate::runtime::expr) fn write_smt(&self, cx: &SymCx, out: &mut String) {
         match self.kind() {
             SymExprKind::Const(value) => {

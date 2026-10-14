@@ -44,6 +44,13 @@ pub(super) fn instantiation_lemmas(
     let mut lemmas = String::new();
     for (op, left, right) in applications {
         let Some(uf) = op.uf_name() else { continue };
+        // The solver's `bv*div/rem` by zero is all-ones, the EVM's is zero; the axioms assume EVM.
+        if super::uf_axioms_enabled()
+            && matches!(op, SymBinOp::UDiv | SymBinOp::URem | SymBinOp::SDiv | SymBinOp::SRem)
+            && right.eval_model(model).is_ok_and(|divisor| divisor.is_zero())
+        {
+            continue;
+        }
         let (Ok(left), Ok(right)) = (left.eval_model(model), right.eval_model(model)) else {
             continue;
         };

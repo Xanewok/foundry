@@ -13,6 +13,7 @@ mod congruence;
 mod fallback;
 mod normalize;
 mod reasoning;
+mod axioms;
 mod refine;
 mod smt;
 
@@ -23,6 +24,7 @@ use normalize::{
     sorted_bool_exprs_are_subset,
 };
 use reasoning::{product_monotonic_unsat_normalized, remove_implied_monotonic_constraints};
+use axioms::{uf_axioms, uf_axioms_enabled};
 use refine::{instantiation_lemmas, refine_rounds, uf_applications};
 use smt::write_smt_assertions;
 
@@ -614,7 +616,14 @@ impl SmtLibSubprocessSolver {
                 return Ok(output);
             }
             let added = instantiation_lemmas(&applications, &candidate, &mut seen);
-            if added.is_empty() || round == rounds {
+            if added.is_empty() {
+                // Every application is already pinned at the model's operands, or unevaluable:
+                // the model fails validation for a reason no instance lemma can fix.
+                trace!(round, "refinement gave up: no new instance (non-UF validation failure)");
+                break;
+            }
+            if round == rounds {
+                trace!(round, "refinement gave up: round limit");
                 break;
             }
             trace!(round, "refining uninterpreted non-linear abstraction");
@@ -679,6 +688,9 @@ impl SmtLibSubprocessSolver {
                 1,
             );
             smt.push_str(lemmas);
+            if uf_axioms_enabled() {
+                smt.push_str(&uf_axioms(cx, &uf_applications(smt_constraints)));
+            }
         }
         smt.push_str("(check-sat)\n");
         if model {

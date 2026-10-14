@@ -59,7 +59,7 @@ fn imply(premise: &str, conclusion: &str) -> String {
 /// pointwise at most `q`'s, in either order, `p <= q`. Since `q` does not wrap and `p`'s integer
 /// product is at most `q`'s, `p` does not wrap either.
 pub(super) fn uf_axioms(cx: &SymCx, applications: &[(SymBinOp, SymExpr, SymExpr)]) -> String {
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen: HashSet<String> = HashSet::default();
     let mut out = String::new();
     let mut emit = |axiom: String| {
         if seen.insert(axiom.clone()) {

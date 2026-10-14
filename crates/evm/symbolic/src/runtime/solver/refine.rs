@@ -15,6 +15,13 @@ pub(super) fn refine_rounds() -> usize {
         .unwrap_or(DEFAULT_ROUNDS)
 }
 
+/// Whether a model request whose abstract model is spurious is retried with exact arithmetic.
+pub(super) fn exact_fallback_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    uf_nonlinear_enabled()
+        && *ON.get_or_init(|| std::env::var_os("FOUNDRY_SYMBOLIC_UF_EXACT_FALLBACK").is_some())
+}
+
 /// Every abstracted `op(left, right)` reachable from `constraints`.
 pub(super) fn uf_applications(constraints: &[SymBoolExpr]) -> Vec<(SymBinOp, SymExpr, SymExpr)> {
     let mut applications = Vec::new();
@@ -81,6 +88,30 @@ mod tests {
         let applications = uf_applications(&constraints);
         assert_eq!(applications.len(), 1);
         assert_eq!(applications[0].0, SymBinOp::Mul);
+    }
+
+    #[test]
+    fn exact_arithmetic_scope_nests_and_restores() {
+        assert!(!exact_arithmetic_active());
+        with_exact_arithmetic(|| {
+            with_exact_arithmetic(|| assert!(exact_arithmetic_active()));
+            assert!(exact_arithmetic_active());
+        });
+        assert!(!exact_arithmetic_active());
+    }
+
+    #[test]
+    fn exact_arithmetic_query_text_has_no_uninterpreted_symbols() {
+        let mut cx = SymCx::new();
+        let x = SymExpr::var(&mut cx, "x");
+        let y = SymExpr::var(&mut cx, "y");
+        let six = SymExpr::constant(&mut cx, U256::from(6));
+        let product = SymExpr::binop(&mut cx, SymBinOp::Mul, x, y);
+        let constraint = SymBoolExpr::eq(&mut cx, product, six);
+
+        let mut smt = String::new();
+        with_exact_arithmetic(|| write_smt_assertions(&cx, &mut smt, &[constraint]).unwrap());
+        assert!(smt.contains("bvmul") && !smt.contains("__uf_"), "{smt}");
     }
 
     #[test]

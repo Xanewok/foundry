@@ -23,7 +23,7 @@ use normalize::{
     sorted_bool_exprs_are_subset,
 };
 use reasoning::{product_monotonic_unsat_normalized, remove_implied_monotonic_constraints};
-use refine::{instantiation_lemmas, refine_rounds, uf_applications};
+use refine::{exact_fallback_enabled, instantiation_lemmas, refine_rounds, uf_applications};
 use smt::write_smt_assertions;
 
 pub(crate) use fallback::{
@@ -587,6 +587,10 @@ impl SmtLibSubprocessSolver {
     /// assertions are facts about the real operators. When refinement gives up, a model request
     /// fails with `SolverUnknown`, while a feasibility check keeps the over-approximate `sat`,
     /// which only explores an extra path and never yields a confirmed counterexample.
+    ///
+    /// With `FOUNDRY_SYMBOLIC_UF_EXACT_FALLBACK`, a model request that ends on a spurious model
+    /// is re-asked with exact arithmetic instead. The abstract rounds then skip portfolio-side
+    /// validation (as refinement does), because the retry replaces the answer.
     fn query_refined(
         &mut self,
         cx: &SymCx,
@@ -595,7 +599,9 @@ impl SmtLibSubprocessSolver {
         model_constraints: &[SymBoolExpr],
     ) -> Result<String, SymbolicError> {
         let rounds = refine_rounds();
-        let applications = if rounds == 0 { Vec::new() } else { uf_applications(smt_constraints) };
+        let fallback = model && exact_fallback_enabled();
+        let applications =
+            if rounds == 0 && !fallback { Vec::new() } else { uf_applications(smt_constraints) };
         if applications.is_empty() {
             return self.query_normalized(cx, smt_constraints, model, model_constraints);
         }
@@ -619,6 +625,12 @@ impl SmtLibSubprocessSolver {
             }
             trace!(round, "refining uninterpreted non-linear abstraction");
             lemmas.push_str(&added);
+        }
+        if fallback {
+            trace!("uninterpreted model failed validation, retrying with exact arithmetic");
+            return with_exact_arithmetic(|| {
+                self.query_normalized(cx, smt_constraints, true, model_constraints)
+            });
         }
         if model { Err(SymbolicError::SolverUnknown) } else { Ok("sat\n".to_string()) }
     }

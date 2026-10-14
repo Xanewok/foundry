@@ -2224,6 +2224,27 @@ pub(crate) fn uf_nonlinear_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FOUNDRY_SYMBOLIC_UF_NONLINEAR").is_some())
 }
 
+thread_local! {
+    static EXACT_ARITHMETIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn exact_arithmetic_active() -> bool {
+    EXACT_ARITHMETIC.with(std::cell::Cell::get)
+}
+
+/// Runs `f` with the uninterpreted abstraction off on this thread, so SMT text built inside
+/// uses the real operators. Contract: build the query text inside `f`, never on another thread.
+pub(crate) fn with_exact_arithmetic<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            EXACT_ARITHMETIC.with(|exact| exact.set(self.0));
+        }
+    }
+    let _restore = Restore(EXACT_ARITHMETIC.with(|exact| exact.replace(true)));
+    f()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum SymBinOp {
     Add,
@@ -2246,7 +2267,13 @@ impl SymBinOp {
     /// as uninterpreted functions, an over-approximation: `unsat` stays valid, `sat` may be spurious.
     pub(crate) fn smt_for(self, left: &SymExpr, right: &SymExpr) -> &'static str {
         match self.uf_name() {
-            Some(name) if uf_nonlinear_enabled() && self.abstracts(left, right) => name,
+            Some(name)
+                if uf_nonlinear_enabled()
+                    && !exact_arithmetic_active()
+                    && self.abstracts(left, right) =>
+            {
+                name
+            }
             _ => self.smt(),
         }
     }

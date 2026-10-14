@@ -148,6 +148,9 @@ pub enum SymbolicRunResult {
         args: Vec<DynSolValue>,
         /// ABI-encoded calldata for the failing invocation.
         calldata: Bytes,
+        /// Whether the run called `svm` helpers; concrete replay has no code there, so it fails
+        /// at the first such call and cannot confirm this counterexample.
+        called_svm_helpers: bool,
         /// Execution counters collected before the counterexample was returned.
         stats: SymbolicStats,
     },
@@ -408,6 +411,7 @@ pub struct SymbolicExecutor {
     deadline: Option<Instant>,
     nested_deferred_mode: DeferredPathMode,
     stateless_retry_safe: bool,
+    called_svm_helpers: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

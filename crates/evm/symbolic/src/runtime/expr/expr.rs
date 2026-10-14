@@ -776,6 +776,11 @@ impl SymExpr {
     }
 
     pub(crate) fn keccak_symbol(cx: &mut SymCx, name: Symbol, len: Self, bytes: Vec<Self>) -> Self {
+        if let Some(len) = len.as_const().and_then(|len| usize::try_from(len).ok())
+            && let Some(hashed) = bytes.get(..len)
+        {
+            cx.record_application(name, ApplicationKind::Keccak, hashed);
+        }
         Self::from_kind(cx, SymExprKind::Keccak { name, len, bytes: bytes.into() })
     }
 
@@ -2044,7 +2049,7 @@ impl SymExpr {
                 out.push(')');
             }
             SymExprKind::BinOp(op, left, right) => {
-                let _ = write!(out, "({} ", op.smt());
+                let _ = write!(out, "({} ", op.smt_for(left, right));
                 left.write_smt(cx, out);
                 out.push(' ');
                 right.write_smt(cx, out);
@@ -2214,6 +2219,32 @@ impl SymTernOp {
     }
 }
 
+pub(crate) fn uf_nonlinear_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FOUNDRY_SYMBOLIC_UF_NONLINEAR").is_some())
+}
+
+thread_local! {
+    static EXACT_ARITHMETIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn exact_arithmetic_active() -> bool {
+    EXACT_ARITHMETIC.with(std::cell::Cell::get)
+}
+
+/// Runs `f` with the uninterpreted abstraction off on this thread, so SMT text built inside
+/// uses the real operators. Contract: build the query text inside `f`, never on another thread.
+pub(crate) fn with_exact_arithmetic<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            EXACT_ARITHMETIC.with(|exact| exact.set(self.0));
+        }
+    }
+    let _restore = Restore(EXACT_ARITHMETIC.with(|exact| exact.replace(true)));
+    f()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum SymBinOp {
     Add,
@@ -2232,6 +2263,40 @@ pub(crate) enum SymBinOp {
 }
 
 impl SymBinOp {
+    /// Experiment: `FOUNDRY_SYMBOLIC_UF_NONLINEAR=1` abstracts non-constant products and quotients
+    /// as uninterpreted functions, an over-approximation: `unsat` stays valid, `sat` may be spurious.
+    pub(crate) fn smt_for(self, left: &SymExpr, right: &SymExpr) -> &'static str {
+        match self.uf_name() {
+            Some(name)
+                if uf_nonlinear_enabled()
+                    && !exact_arithmetic_active()
+                    && self.abstracts(left, right) =>
+            {
+                name
+            }
+            _ => self.smt(),
+        }
+    }
+
+    /// The uninterpreted function standing in for this operator when it is abstracted.
+    pub(crate) const fn uf_name(self) -> Option<&'static str> {
+        match self {
+            Self::Mul => Some("__uf_mul"),
+            Self::UDiv => Some("__uf_udiv"),
+            Self::URem => Some("__uf_urem"),
+            Self::SDiv => Some("__uf_sdiv"),
+            Self::SRem => Some("__uf_srem"),
+            _ => None,
+        }
+    }
+
+    /// Whether the abstraction replaces this operator over these operands, ignoring the flag.
+    pub(crate) fn abstracts(self, left: &SymExpr, right: &SymExpr) -> bool {
+        self.uf_name().is_some()
+            && !matches!(left.kind(), SymExprKind::Const(_))
+            && !matches!(right.kind(), SymExprKind::Const(_))
+    }
+
     pub(crate) const fn smt(self) -> &'static str {
         match self {
             Self::Add => "bvadd",

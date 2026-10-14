@@ -9,17 +9,21 @@ use std::{
 };
 use wait_timeout::ChildExt;
 
+mod congruence;
 mod fallback;
 mod normalize;
 mod reasoning;
+mod refine;
 mod smt;
 
+use congruence::application_congruence;
 use fallback::{checked_mul_guard_branch_model, constraints_prefer_hard_arith_fallback_first};
 use normalize::{
     constraints_are_directly_unsat, normalize_constraints_for_solver_cached,
     sorted_bool_exprs_are_subset,
 };
 use reasoning::{product_monotonic_unsat_normalized, remove_implied_monotonic_constraints};
+use refine::{exact_fallback_enabled, instantiation_lemmas, refine_rounds, uf_applications};
 use smt::write_smt_assertions;
 
 pub(crate) use fallback::{
@@ -137,6 +141,7 @@ pub(crate) struct SmtLibSubprocessSolver {
     smt_build_time: Duration,
     smt_max_query_time: Duration,
     z3_session: Option<Z3Session>,
+    last_query_uf: bool,
 }
 
 impl SmtLibSubprocessSolver {
@@ -165,6 +170,7 @@ impl SmtLibSubprocessSolver {
             smt_build_time: Duration::ZERO,
             smt_max_query_time: Duration::ZERO,
             z3_session: None,
+            last_query_uf: false,
         }
     }
 
@@ -274,6 +280,7 @@ impl SmtLibSubprocessSolver {
         if constraints.iter().any(SymBoolExpr::contains_gasleft) {
             return Err(SymbolicError::Unsupported("GAS/gasleft() not modeled"));
         }
+        let constraints = &with_application_congruence(cx, constraints);
         self.model_queries += 1;
         let smt_constraints =
             normalize_constraints_for_solver_cached(cx, constraints, &mut self.normalization_cache);
@@ -349,7 +356,7 @@ impl SmtLibSubprocessSolver {
             self.cache_model_result(cache_key, model.clone());
             return Ok(model);
         }
-        let output = match self.query_normalized(cx, &smt_constraints, true, constraints) {
+        let output = match self.query_refined(cx, &smt_constraints, true, constraints) {
             Ok(output) => output,
             Err(SymbolicError::SolverUnknown) => {
                 if let Some(model) =
@@ -368,7 +375,12 @@ impl SmtLibSubprocessSolver {
         let mut lines = output.lines();
         match lines.next().unwrap_or_default().trim() {
             "sat" => {
-                let model = parse_and_validate_model(cx, &output, constraints)?;
+                let model = match parse_and_validate_model(cx, &output, constraints) {
+                    Err(SymbolicError::Solver(_)) if self.last_query_uf => {
+                        return Err(SymbolicError::SolverUnknown);
+                    }
+                    model => model?,
+                };
                 self.cache_sat_result(cache_key.clone(), true);
                 self.cache_model_result(cache_key, model.clone());
                 Ok(model)
@@ -400,6 +412,7 @@ impl SmtLibSubprocessSolver {
         constraints: &[SymBoolExpr],
         defer_hard_arith_without_witness: bool,
     ) -> Result<BranchFeasibility, SymbolicError> {
+        let constraints = &with_application_congruence(cx, constraints);
         self.sat_queries += 1;
         let smt_constraints =
             normalize_sat_constraints(cx, constraints, &mut self.normalization_cache);
@@ -500,7 +513,7 @@ impl SmtLibSubprocessSolver {
                 return Ok(BranchFeasibility::NeedsSolver);
             }
         }
-        let output = match self.query_normalized(cx, &smt_constraints, false, constraints) {
+        let output = match self.query_refined(cx, &smt_constraints, false, constraints) {
             Ok(output) => output,
             Err(SymbolicError::SolverUnknown) => {
                 if validated_hard_arith_fallback_model(cx, &smt_constraints, constraints).is_some()
@@ -566,6 +579,62 @@ impl SmtLibSubprocessSolver {
             .any(|(cached_key, result)| !*result && sorted_bool_exprs_are_subset(cached_key, key))
     }
 
+    /// Like [`Self::query_normalized`], but refines the uninterpreted non-linear abstraction.
+    ///
+    /// A `sat` is returned only if its model satisfies `model_constraints` under real arithmetic.
+    /// Otherwise each abstracted application is pinned to the real operator at the model's operand
+    /// values and the query is repeated. `unsat` is sound at every round, because the added
+    /// assertions are facts about the real operators. When refinement gives up, a model request
+    /// fails with `SolverUnknown`, while a feasibility check keeps the over-approximate `sat`,
+    /// which only explores an extra path and never yields a confirmed counterexample.
+    ///
+    /// With `FOUNDRY_SYMBOLIC_UF_EXACT_FALLBACK`, a model request that ends on a spurious model
+    /// is re-asked with exact arithmetic instead. The abstract rounds then skip portfolio-side
+    /// validation (as refinement does), because the retry replaces the answer.
+    fn query_refined(
+        &mut self,
+        cx: &SymCx,
+        smt_constraints: &[SymBoolExpr],
+        model: bool,
+        model_constraints: &[SymBoolExpr],
+    ) -> Result<String, SymbolicError> {
+        let rounds = refine_rounds();
+        let fallback = model && exact_fallback_enabled();
+        let applications =
+            if rounds == 0 && !fallback { Vec::new() } else { uf_applications(smt_constraints) };
+        if applications.is_empty() {
+            return self.query_normalized(cx, smt_constraints, model, model_constraints);
+        }
+
+        let mut symbols = model_symbols_for_constraints(cx, model_constraints);
+        symbols.extend(model_symbols_for_constraints(cx, smt_constraints));
+        let mut lemmas = String::new();
+        let mut seen = HashSet::default();
+        for round in 0..=rounds {
+            let output = self.query_with_lemmas(cx, smt_constraints, true, None, &lemmas)?;
+            if output.lines().next().unwrap_or_default().trim() != "sat" {
+                return Ok(output);
+            }
+            let candidate = parse_model_with_symbols(&output, &symbols)?;
+            if eval_model_constraints(model_constraints, &candidate) {
+                return Ok(output);
+            }
+            let added = instantiation_lemmas(&applications, &candidate, &mut seen);
+            if added.is_empty() || round == rounds {
+                break;
+            }
+            trace!(round, "refining uninterpreted non-linear abstraction");
+            lemmas.push_str(&added);
+        }
+        if fallback {
+            trace!("uninterpreted model failed validation, retrying with exact arithmetic");
+            return with_exact_arithmetic(|| {
+                self.query_normalized(cx, smt_constraints, true, model_constraints)
+            });
+        }
+        if model { Err(SymbolicError::SolverUnknown) } else { Ok("sat\n".to_string()) }
+    }
+
     /// Sends already-normalized constraints to the configured solver portfolio.
     pub(crate) fn query_normalized(
         &mut self,
@@ -573,6 +642,19 @@ impl SmtLibSubprocessSolver {
         smt_constraints: &[SymBoolExpr],
         model: bool,
         model_constraints: &[SymBoolExpr],
+    ) -> Result<String, SymbolicError> {
+        self.query_with_lemmas(cx, smt_constraints, model, model.then_some(model_constraints), "")
+    }
+
+    /// `validate` makes a portfolio reject `sat` models that fail it; `lemmas` are extra
+    /// assertions appended to queries that use the uninterpreted functions.
+    fn query_with_lemmas(
+        &mut self,
+        cx: &SymCx,
+        smt_constraints: &[SymBoolExpr],
+        model: bool,
+        validate: Option<&[SymBoolExpr]>,
+        lemmas: &str,
     ) -> Result<String, SymbolicError> {
         self.smt_queries += 1;
         let build_started = Instant::now();
@@ -598,6 +680,18 @@ impl SmtLibSubprocessSolver {
             let _ = writeln!(smt, "(declare-fun {name} () (_ BitVec 256))");
         }
         write_smt_assertions(cx, &mut smt, smt_constraints)?;
+        self.last_query_uf = smt.contains("(__uf_");
+        if self.last_query_uf {
+            let decls = ["mul", "udiv", "urem", "sdiv", "srem"].map(|op| {
+                format!("(declare-fun __uf_{op} ((_ BitVec 256) (_ BitVec 256)) (_ BitVec 256))\n")
+            });
+            smt = smt.replacen(
+                "(set-logic QF_BV)\n",
+                &format!("(set-logic QF_UFBV)\n{}", decls.concat()),
+                1,
+            );
+            smt.push_str(lemmas);
+        }
         smt.push_str("(check-sat)\n");
         if model {
             smt.push_str("(get-model)\n");
@@ -620,13 +714,7 @@ impl SmtLibSubprocessSolver {
             let output = self.query_z3(command, &smt).into_result();
             SolverCommandRun { output, summaries: Vec::new() }
         } else {
-            run_solver_commands(
-                cx,
-                &commands,
-                &smt,
-                self.timeout,
-                model.then_some(model_constraints),
-            )
+            run_solver_commands(cx, &commands, &smt, self.timeout, validate)
         };
         let query_time = started.elapsed();
         self.solver_time += query_time;
@@ -663,6 +751,13 @@ impl SmtLibSubprocessSolver {
             other => other,
         }
     }
+}
+
+/// Prepends the application axioms, keeping the last constraint last for branch-complement checks.
+fn with_application_congruence(cx: &mut SymCx, constraints: &[SymBoolExpr]) -> Vec<SymBoolExpr> {
+    let mut all = application_congruence(cx, constraints);
+    all.extend_from_slice(constraints);
+    all
 }
 
 fn cache_result<K, V>(cache: &mut HashMap<K, V>, key: K, value: V, max_entries: usize)
@@ -1680,10 +1775,15 @@ fn parse_model_values(
 ) -> Result<(), SymbolicError> {
     let mut tokens = output
         .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')'))
-        .filter(|token| !token.is_empty());
+        .filter(|token| !token.is_empty())
+        .peekable();
     while let Some(token) = tokens.next() {
         if token == "define-fun" {
             let Some(name) = tokens.next() else { continue };
+            if name.starts_with("__uf_") {
+                while tokens.next_if(|token| *token != "define-fun").is_some() {}
+                continue;
+            }
             while let Some(value) = tokens.next() {
                 if let Some(hex) = value.strip_prefix("#x") {
                     if hex.len() > 64 {

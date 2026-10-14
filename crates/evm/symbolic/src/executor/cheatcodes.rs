@@ -2279,6 +2279,7 @@ impl SymbolicExecutor {
         let Some(cheatcode) = SymbolicVmCheatcode::from_selector(selector) else {
             return Err(SymbolicError::Unsupported("symbolic VM compatibility cheatcode"));
         };
+        self.called_svm_helpers = true;
         let args_offset = in_offset + 4;
 
         match cheatcode {

@@ -19,6 +19,7 @@ impl SymbolicExecutor {
             deadline: None,
             nested_deferred_mode: DeferredPathMode::Skip,
             stateless_retry_safe: true,
+            called_svm_helpers: false,
         }
     }
 
@@ -26,6 +27,7 @@ impl SymbolicExecutor {
         self.deferred_incomplete = None;
         self.nested_deferred_mode = DeferredPathMode::Skip;
         self.stateless_retry_safe = true;
+        self.called_svm_helpers = false;
         self.deadline = if use_wall_clock_deadline {
             self.config
                 .timeout
@@ -515,6 +517,7 @@ impl SymbolicExecutor {
                         return Ok(SymbolicRunResult::Counterexample {
                             args,
                             calldata,
+                            called_svm_helpers: self.called_svm_helpers,
                             stats: self.stats_with_paths(*completed_paths + 1),
                         });
                     }

@@ -9,11 +9,13 @@ use std::{
 };
 use wait_timeout::ChildExt;
 
+mod congruence;
 mod fallback;
 mod normalize;
 mod reasoning;
 mod smt;
 
+use congruence::application_congruence;
 use fallback::{checked_mul_guard_branch_model, constraints_prefer_hard_arith_fallback_first};
 use normalize::{
     constraints_are_directly_unsat, normalize_constraints_for_solver_cached,
@@ -137,6 +139,7 @@ pub(crate) struct SmtLibSubprocessSolver {
     smt_build_time: Duration,
     smt_max_query_time: Duration,
     z3_session: Option<Z3Session>,
+    last_query_uf: bool,
 }
 
 impl SmtLibSubprocessSolver {
@@ -165,6 +168,7 @@ impl SmtLibSubprocessSolver {
             smt_build_time: Duration::ZERO,
             smt_max_query_time: Duration::ZERO,
             z3_session: None,
+            last_query_uf: false,
         }
     }
 
@@ -274,6 +278,7 @@ impl SmtLibSubprocessSolver {
         if constraints.iter().any(SymBoolExpr::contains_gasleft) {
             return Err(SymbolicError::Unsupported("GAS/gasleft() not modeled"));
         }
+        let constraints = &with_application_congruence(cx, constraints);
         self.model_queries += 1;
         let smt_constraints =
             normalize_constraints_for_solver_cached(cx, constraints, &mut self.normalization_cache);
@@ -368,7 +373,12 @@ impl SmtLibSubprocessSolver {
         let mut lines = output.lines();
         match lines.next().unwrap_or_default().trim() {
             "sat" => {
-                let model = parse_and_validate_model(cx, &output, constraints)?;
+                let model = match parse_and_validate_model(cx, &output, constraints) {
+                    Err(SymbolicError::Solver(_)) if self.last_query_uf => {
+                        return Err(SymbolicError::SolverUnknown);
+                    }
+                    model => model?,
+                };
                 self.cache_sat_result(cache_key.clone(), true);
                 self.cache_model_result(cache_key, model.clone());
                 Ok(model)
@@ -400,6 +410,7 @@ impl SmtLibSubprocessSolver {
         constraints: &[SymBoolExpr],
         defer_hard_arith_without_witness: bool,
     ) -> Result<BranchFeasibility, SymbolicError> {
+        let constraints = &with_application_congruence(cx, constraints);
         self.sat_queries += 1;
         let smt_constraints =
             normalize_sat_constraints(cx, constraints, &mut self.normalization_cache);
@@ -598,6 +609,17 @@ impl SmtLibSubprocessSolver {
             let _ = writeln!(smt, "(declare-fun {name} () (_ BitVec 256))");
         }
         write_smt_assertions(cx, &mut smt, smt_constraints)?;
+        self.last_query_uf = smt.contains("(__uf_");
+        if self.last_query_uf {
+            let decls = ["mul", "udiv", "urem", "sdiv", "srem"].map(|op| {
+                format!("(declare-fun __uf_{op} ((_ BitVec 256) (_ BitVec 256)) (_ BitVec 256))\n")
+            });
+            smt = smt.replacen(
+                "(set-logic QF_BV)\n",
+                &format!("(set-logic QF_UFBV)\n{}", decls.concat()),
+                1,
+            );
+        }
         smt.push_str("(check-sat)\n");
         if model {
             smt.push_str("(get-model)\n");
@@ -663,6 +685,13 @@ impl SmtLibSubprocessSolver {
             other => other,
         }
     }
+}
+
+/// Prepends the application axioms, keeping the last constraint last for branch-complement checks.
+fn with_application_congruence(cx: &mut SymCx, constraints: &[SymBoolExpr]) -> Vec<SymBoolExpr> {
+    let mut all = application_congruence(cx, constraints);
+    all.extend_from_slice(constraints);
+    all
 }
 
 fn cache_result<K, V>(cache: &mut HashMap<K, V>, key: K, value: V, max_entries: usize)
@@ -1680,10 +1709,15 @@ fn parse_model_values(
 ) -> Result<(), SymbolicError> {
     let mut tokens = output
         .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')'))
-        .filter(|token| !token.is_empty());
+        .filter(|token| !token.is_empty())
+        .peekable();
     while let Some(token) = tokens.next() {
         if token == "define-fun" {
             let Some(name) = tokens.next() else { continue };
+            if name.starts_with("__uf_") {
+                while tokens.next_if(|token| *token != "define-fun").is_some() {}
+                continue;
+            }
             while let Some(value) = tokens.next() {
                 if let Some(hex) = value.strip_prefix("#x") {
                     if hex.len() > 64 {

@@ -5,6 +5,9 @@ use foundry_evm::{
 
 use super::*;
 
+/// EIP-170 runtime code size limit.
+const MAX_ETCH_CODE_SIZE: usize = 0x6000;
+
 impl SymbolicExecutor {
     pub(super) fn handle_assertion(
         &mut self,
@@ -1269,7 +1272,9 @@ impl SymbolicExecutor {
                     state,
                     args_offset,
                     1,
-                    self.config.max_dynamic_length as usize,
+                    // Etched code is real runtime code, routinely longer than the symbolic dynamic-length
+                    // bound (e.g. restoring `address(x).code`); only its length must be concrete.
+                    (self.config.max_dynamic_length as usize).max(MAX_ETCH_CODE_SIZE),
                     "symbolic vm.etch",
                 )?;
                 let code = SymCode::from_byte_exprs(&mut self.cx, code);
@@ -2279,6 +2284,7 @@ impl SymbolicExecutor {
         let Some(cheatcode) = SymbolicVmCheatcode::from_selector(selector) else {
             return Err(SymbolicError::Unsupported("symbolic VM compatibility cheatcode"));
         };
+        self.called_svm_helpers = true;
         let args_offset = in_offset + 4;
 
         match cheatcode {

@@ -2431,9 +2431,15 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
                     None,
                 ),
             ),
-            SymbolicRunResult::Counterexample { args, calldata, stats } => {
-                self.replay_symbolic_counterexample(func, args, calldata, stats, &symbolic_config)
-            }
+            SymbolicRunResult::Counterexample { args, calldata, called_svm_helpers, stats } => self
+                .replay_symbolic_counterexample(
+                    func,
+                    args,
+                    calldata,
+                    called_svm_helpers,
+                    stats,
+                    &symbolic_config,
+                ),
         };
         let symbolic_result = match corpus_seed_metadata {
             Some(metadata) => symbolic_result.with_corpus_seeds(metadata),
@@ -2450,6 +2456,7 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
         func: &Function,
         args: Vec<DynSolValue>,
         calldata: Bytes,
+        called_svm_helpers: bool,
         stats: SymbolicStats,
         symbolic_config: &SymbolicConfig,
     ) -> (TestStatus, Option<String>, Option<CounterExample>, SymbolicResult) {
@@ -2467,6 +2474,24 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
                 Some(symbolic_counterexample.clone()),
             )
         };
+
+        // Replay reverts at the first `svm` call, which would pass for any failure; only a
+        // replay that reproduces the failure may confirm.
+        if called_svm_helpers {
+            let reason =
+                "symbolic counterexample called svm helpers, which concrete replay cannot execute"
+                    .to_string();
+            let display_reason = format!(
+                "incomplete symbolic execution ({:?}): {reason}",
+                SymbolicStopReason::Error
+            );
+            let symbolic_result = incomplete(
+                reason.clone(),
+                SymbolicReplayMetadata::mismatch(reason),
+                SymbolicCallTrace::none(),
+            );
+            return (TestStatus::Failure, Some(display_reason), None, symbolic_result);
+        }
 
         let (raw, reason) = match self.executor.call(
             self.sender,

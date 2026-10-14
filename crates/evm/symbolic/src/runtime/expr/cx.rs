@@ -2,6 +2,13 @@ use super::{hashcons::HashCons, *};
 use alloy_primitives::map::DefaultHashBuilder;
 use inturn::unsync::Interner;
 
+/// Functions the engine models as opaque symbols named by their input expressions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ApplicationKind {
+    Storage(Address),
+    Keccak,
+}
+
 pub(crate) struct SymCx {
     words: HashCons<SymExprKind>,
     bools: HashCons<SymBoolExprKind>,
@@ -9,6 +16,7 @@ pub(crate) struct SymCx {
     symbols: Interner<Symbol, DefaultHashBuilder>,
     replayable_inputs: SymbolicVars,
     concrete_keccak_preimages: HashMap<U256, Arc<[SymExpr]>>,
+    applications: HashMap<Symbol, (ApplicationKind, Arc<[SymExpr]>)>,
     cache: SymCxCache,
 }
 
@@ -40,6 +48,7 @@ impl SymCx {
             symbols: Interner::with_hasher(DefaultHashBuilder::default()),
             replayable_inputs: SymbolicVars::default(),
             concrete_keccak_preimages: HashMap::default(),
+            applications: HashMap::default(),
             cache: SymCxCache { zero, one, bool_true, bool_false, bytes_empty },
         }
     }
@@ -85,6 +94,21 @@ impl SymCx {
 
     pub(crate) fn is_replayable_input(&self, symbol: Symbol) -> bool {
         self.replayable_inputs.contains(&symbol)
+    }
+
+    /// Registers an opaque symbol that stands for a function of `inputs`; the solver ties
+    /// applications of one kind to equal values when their inputs are equal.
+    pub(crate) fn record_application(
+        &mut self,
+        symbol: Symbol,
+        kind: ApplicationKind,
+        inputs: impl Into<Arc<[SymExpr]>>,
+    ) {
+        self.applications.entry(symbol).or_insert_with(|| (kind, inputs.into()));
+    }
+
+    pub(crate) fn application(&self, symbol: Symbol) -> Option<&(ApplicationKind, Arc<[SymExpr]>)> {
+        self.applications.get(&symbol)
     }
 
     pub(in crate::runtime::expr) fn record_concrete_keccak_preimage(

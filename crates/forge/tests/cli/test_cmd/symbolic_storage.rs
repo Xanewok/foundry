@@ -432,7 +432,7 @@ contract SymbolicGenericStorage {
 ...
 Ran 2 tests for test/SymbolicGenericStorage.t.sol:SymbolicGenericStorage
 [FAIL: incomplete symbolic execution (Error): symbolic counterexample did not replay] checkNativeGenericStorage(address) ([METRICS])
-[FAIL: EvmError: Revert; counterexample: 		[SENDER] [SENDER] [CALLDATA] [ARGS]] checkSvmArbitraryStorage(address) ([METRICS])
+[FAIL: incomplete symbolic execution (Error): symbolic counterexample called svm helpers, which concrete replay cannot execute] checkSvmArbitraryStorage(address) ([METRICS])
 Suite result: FAILED. 0 passed; 2 failed; 0 skipped; [ELAPSED]
 ...
 "#]])
@@ -441,6 +441,66 @@ Suite result: FAILED. 0 passed; 2 failed; 0 skipped; [ELAPSED]
 
     assert!(!stdout.contains("symbolic SLOAD key"), "{stdout}");
     assert!(!stdout.contains("symbolic Halmos compatibility cheatcode"), "{stdout}");
+}
+
+// Symbolic keys that are equal on the path address one slot, so abstract reads through them must
+// agree, including through the hashed key of a nested mapping; keys the path leaves distinct stay
+// independent.
+#[forgetest_init]
+fn symbolic_storage_reads_through_equal_keys_agree(prj: _, cmd: _) {
+    skip_unless_z3!("symbolic_storage_reads_through_equal_keys_agree");
+
+    prj.add_test(
+        "SymbolicStorageKeyAliasing.t.sol",
+        r#"
+contract SymbolicStorageKeyAliasing {
+    mapping(address => uint256) balances;
+    mapping(address => mapping(address => uint256)) allowances;
+
+    /// forge-config: default.symbolic.storage_layout = "generic"
+    function checkEqualKeysReadEqualValues(uint256 a, uint256 b) public view {
+        require(a == b);
+        assert(balances[address(uint160(a))] == balances[address(uint160(b))]);
+    }
+
+    /// forge-config: default.symbolic.storage_layout = "generic"
+    function checkEqualNestedKeysReadEqualValues(
+        uint256 owner1,
+        uint256 spender1,
+        uint256 owner2,
+        uint256 spender2
+    ) public view {
+        require(owner1 == owner2 && spender1 == spender2);
+        assert(
+            allowances[address(uint160(owner1))][address(uint160(spender1))]
+                == allowances[address(uint160(owner2))][address(uint160(spender2))]
+        );
+    }
+
+    /// forge-config: default.symbolic.storage_layout = "generic"
+    function checkDistinctKeysMayDiffer(address a, address b) public view {
+        assert(balances[a] == balances[b]);
+    }
+}
+"#,
+    );
+
+    assert_symbolic(cmd.args([
+        "test",
+        "--symbolic",
+        "--match-contract",
+        "SymbolicStorageKeyAliasing",
+    ]))
+    .failure()
+    .stdout_eq(str![[r#"
+...
+Ran 3 tests for test/SymbolicStorageKeyAliasing.t.sol:SymbolicStorageKeyAliasing
+[FAIL: incomplete symbolic execution (Error): symbolic counterexample did not replay] checkDistinctKeysMayDiffer(address,address) ([METRICS])
+[PASS] checkEqualKeysReadEqualValues(uint256,uint256) ([METRICS])
+[PASS] checkEqualNestedKeysReadEqualValues(uint256,uint256,uint256,uint256) ([METRICS])
+Suite result: FAILED. 2 passed; 1 failed; 0 skipped; [ELAPSED]
+...
+"#]]);
 }
 
 // Reading an unwritten mapping at a symbolic key must yield a fresh symbolic

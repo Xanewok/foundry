@@ -2344,11 +2344,13 @@ impl SymbolicWorld {
 }
 
 fn symbolic_storage_symbol(cx: &mut SymCx, address: Address, key: &SymExpr) -> Symbol {
-    stable_symbol(
+    let symbol = stable_symbol(
         cx,
         "storage",
         format!("{address:?}:{:?}", ExpressionDigests::identity([key])).as_bytes(),
-    )
+    );
+    cx.record_application(symbol, ApplicationKind::Storage(address), [key.clone()]);
+    symbol
 }
 
 #[derive(Clone, Debug)]

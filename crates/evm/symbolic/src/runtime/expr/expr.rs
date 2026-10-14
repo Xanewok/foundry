@@ -776,6 +776,11 @@ impl SymExpr {
     }
 
     pub(crate) fn keccak_symbol(cx: &mut SymCx, name: Symbol, len: Self, bytes: Vec<Self>) -> Self {
+        if let Some(len) = len.as_const().and_then(|len| usize::try_from(len).ok())
+            && let Some(hashed) = bytes.get(..len)
+        {
+            cx.record_application(name, ApplicationKind::Keccak, hashed);
+        }
         Self::from_kind(cx, SymExprKind::Keccak { name, len, bytes: bytes.into() })
     }
 

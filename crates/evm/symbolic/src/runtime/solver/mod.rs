@@ -9,11 +9,13 @@ use std::{
 };
 use wait_timeout::ChildExt;
 
+mod congruence;
 mod fallback;
 mod normalize;
 mod reasoning;
 mod smt;
 
+use congruence::application_congruence;
 use fallback::{checked_mul_guard_branch_model, constraints_prefer_hard_arith_fallback_first};
 use normalize::{
     constraints_are_directly_unsat, normalize_constraints_for_solver_cached,
@@ -274,6 +276,7 @@ impl SmtLibSubprocessSolver {
         if constraints.iter().any(SymBoolExpr::contains_gasleft) {
             return Err(SymbolicError::Unsupported("GAS/gasleft() not modeled"));
         }
+        let constraints = &with_application_congruence(cx, constraints);
         self.model_queries += 1;
         let smt_constraints =
             normalize_constraints_for_solver_cached(cx, constraints, &mut self.normalization_cache);
@@ -400,6 +403,7 @@ impl SmtLibSubprocessSolver {
         constraints: &[SymBoolExpr],
         defer_hard_arith_without_witness: bool,
     ) -> Result<BranchFeasibility, SymbolicError> {
+        let constraints = &with_application_congruence(cx, constraints);
         self.sat_queries += 1;
         let smt_constraints =
             normalize_sat_constraints(cx, constraints, &mut self.normalization_cache);
@@ -663,6 +667,13 @@ impl SmtLibSubprocessSolver {
             other => other,
         }
     }
+}
+
+/// Prepends the application axioms, keeping the last constraint last for branch-complement checks.
+fn with_application_congruence(cx: &mut SymCx, constraints: &[SymBoolExpr]) -> Vec<SymBoolExpr> {
+    let mut all = application_congruence(cx, constraints);
+    all.extend_from_slice(constraints);
+    all
 }
 
 fn cache_result<K, V>(cache: &mut HashMap<K, V>, key: K, value: V, max_entries: usize)

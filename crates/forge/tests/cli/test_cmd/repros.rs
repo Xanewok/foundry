@@ -1436,3 +1436,231 @@ Ran 1 test suite [ELAPSED]: 0 tests passed, 0 failed, 1 skipped (1 total tests)
 
 "#]]);
 }
+
+// An unmet `expectRevert` around a call that switches forks and returns normally reports a
+// failure instead of reverting the call's journal entries on the switched-to fork's journal.
+#[forgetest_init]
+async fn unmet_expect_revert_after_select_fork(prj: _, cmd: _) {
+    let (_api, handle) = spawn(NodeConfig::test()).await;
+    let endpoint = handle.http_endpoint();
+
+    prj.add_test(
+        "UnmetExpectRevertAfterSelectFork.t.sol",
+        &r#"
+import "forge-std/Test.sol";
+
+contract Slot {
+    uint256 public value;
+}
+
+contract Switcher is Test {
+    function select(uint256 fork) external {
+        vm.selectFork(fork);
+    }
+}
+
+contract UnmetExpectRevertAfterSelectForkTest is Test {
+    function test_unmetExpectRevertAfterSelectFork() public {
+        vm.createSelectFork("<url>");
+        uint256 other = vm.createFork("<url>");
+        Switcher switcher = new Switcher();
+        vm.makePersistent(address(switcher));
+
+        // Warms a slot of an account that is not persistent, so the other fork does not hold it.
+        new Slot().value();
+
+        vm.expectRevert(bytes("x"));
+        switcher.select(other);
+    }
+}
+"#
+        .replace("<url>", &endpoint),
+    );
+
+    cmd.args(["test", "--mc", "UnmetExpectRevertAfterSelectForkTest"]).assert_failure().stdout_eq(
+        str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful!
+
+Ran 1 test for test/UnmetExpectRevertAfterSelectFork.t.sol:UnmetExpectRevertAfterSelectForkTest
+[FAIL: next call did not revert as expected] test_unmetExpectRevertAfterSelectFork() (block: [..]) ([GAS])
+Suite result: FAILED. 0 passed; 1 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 0 tests passed, 1 failed, 0 skipped (1 total tests)
+
+Failing tests:
+Encountered 1 failing test in test/UnmetExpectRevertAfterSelectFork.t.sol:UnmetExpectRevertAfterSelectForkTest
+[FAIL: next call did not revert as expected] test_unmetExpectRevertAfterSelectFork() (block: [..]) ([GAS])
+
+Encountered a total of 1 failing tests, 0 tests succeeded
+
+Tip: Run `forge test --rerun` to retry only the 1 failed test
+Tip: Run `forge test --debug --match-test <TEST_NAME>` to inspect one failing test in the debugger
+
+"#]],
+    );
+}
+
+// Post-switch writes roll back when the call reverts. Only `isolate = true` is pinned: without
+// isolation two of these cases leak the writes.
+#[forgetest_init]
+async fn select_fork_revert_isolated(prj: _, mut cmd: _) {
+    let (_api, handle) = spawn(NodeConfig::test()).await;
+    let endpoint = handle.http_endpoint();
+
+    prj.add_test(
+        "ForkJournal.t.sol",
+        &r#"
+import "forge-std/Test.sol";
+
+contract ForkJournalChild {}
+
+contract ForkJournalActor is Test {
+    uint256 public value = 7;
+    address payable constant RECIPIENT = payable(address(0xBEEF));
+
+    function select(uint256 fork) external {
+        vm.selectFork(fork);
+    }
+
+    function mutate() internal {
+        value = 9;
+        new ForkJournalChild();
+        RECIPIENT.transfer(1 ether);
+    }
+
+    function mutateAndRevert() external {
+        mutate();
+        revert("after switch");
+    }
+
+    function selectAndRevert(uint256 fork) external {
+        vm.selectFork(fork);
+        mutate();
+        revert("after switch");
+    }
+
+    function selectAndCatch(uint256 fork) external {
+        vm.selectFork(fork);
+        value = 8;
+        uint64 nonce = vm.getNonce(address(this));
+        try this.mutateAndRevert() {
+            revert("call should revert");
+        } catch Error(string memory reason) {
+            assertEq(reason, "after switch");
+        }
+        assertEq(value, 8);
+        assertEq(address(this).balance, 10 ether);
+        assertEq(RECIPIENT.balance, 0);
+        assertEq(vm.getNonce(address(this)), nonce);
+    }
+}
+
+contract ForkJournalTest is Test {
+    ForkJournalActor actor;
+    uint256 first;
+    uint256 second;
+
+    function setUp() public {
+        first = vm.createSelectFork("<url>");
+        second = vm.createFork("<url>");
+        actor = new ForkJournalActor();
+        vm.makePersistent(address(actor));
+        vm.etch(address(0xBEEF), hex"00");
+        vm.makePersistent(address(0xBEEF));
+        vm.deal(address(actor), 10 ether);
+        vm.deal(address(0xBEEF), 0);
+    }
+
+    function warmSource() internal {
+        // Keep source checkpoints beyond the fresh target's journal, exposing skipped rollback.
+        for (uint256 i; i < 64; ++i) {
+            vm.load(address(0xCAFE), bytes32(i));
+        }
+    }
+
+    function assertUnchanged(uint64 nonce) internal {
+        assertEq(actor.value(), 7, "storage leaked");
+        assertEq(address(actor).balance, 10 ether, "sender balance leaked");
+        assertEq(address(0xBEEF).balance, 0, "recipient balance leaked");
+        assertEq(vm.getNonce(address(actor)), nonce, "nonce leaked");
+    }
+
+    function test_revert_after_fork_switch_and_writes() public {
+        // selection survives; storage, transfers and CREATE nonce revert.
+        warmSource();
+        uint64 nonce = vm.getNonce(address(actor));
+        (bool success, bytes memory data) = address(actor).call(
+            abi.encodeCall(actor.selectAndRevert, (second))
+        );
+        assertFalse(success);
+        assertEq(data, abi.encodeWithSignature("Error(string)", "after switch"));
+        assertEq(vm.activeFork(), second);
+        assertUnchanged(nonce);
+    }
+
+    function test_try_catch_after_fork_switch() public {
+        // a reverted sibling call preserves the selected fork and state.
+        warmSource();
+        actor.select(second);
+        uint64 nonce = vm.getNonce(address(actor));
+        try actor.mutateAndRevert() {
+            revert("call should revert");
+        } catch Error(string memory reason) {
+            assertEq(reason, "after switch");
+        }
+        assertEq(vm.activeFork(), second);
+        assertUnchanged(nonce);
+    }
+
+    function test_expect_revert_met_after_fork_switch() public {
+        // expectRevert succeeds without preserving reverted mutations.
+        warmSource();
+        uint64 nonce = vm.getNonce(address(actor));
+        vm.expectRevert("after switch");
+        actor.selectAndRevert(second);
+        assertEq(vm.activeFork(), second);
+        assertUnchanged(nonce);
+    }
+
+    function test_nested_try_catch_after_fork_switch() public {
+        // the caught child revert preserves the parent's value of 8.
+        warmSource();
+        actor.selectAndCatch(second);
+        assertEq(vm.activeFork(), second);
+        assertEq(actor.value(), 8);
+    }
+
+    function test_switch_back_to_first_fork() public {
+        // fork-local slots survive A/B/A/B and a reverted sibling call.
+        vm.store(address(0xCAFE), bytes32(0), bytes32(uint256(11)));
+        actor.select(second);
+        vm.store(address(0xCAFE), bytes32(0), bytes32(uint256(22)));
+        actor.select(first);
+        assertEq(vm.load(address(0xCAFE), bytes32(0)), bytes32(uint256(11)));
+        uint64 nonce = vm.getNonce(address(actor));
+        vm.expectRevert("after switch");
+        actor.mutateAndRevert();
+        assertUnchanged(nonce);
+        actor.select(second);
+        assertEq(vm.load(address(0xCAFE), bytes32(0)), bytes32(uint256(22)));
+    }
+}
+"#
+        .replace("<url>", &endpoint),
+    );
+
+    cmd.env("FOUNDRY_ISOLATE", "true");
+    cmd.args(["test", "--mc", "ForkJournalTest"]).assert_success().stdout_eq(str![[r#"
+...
+Ran 5 tests for test/ForkJournal.t.sol:ForkJournalTest
+[PASS] test_expect_revert_met_after_fork_switch() ([GAS])
+[PASS] test_nested_try_catch_after_fork_switch() ([GAS])
+[PASS] test_revert_after_fork_switch_and_writes() ([GAS])
+[PASS] test_switch_back_to_first_fork() ([GAS])
+[PASS] test_try_catch_after_fork_switch() ([GAS])
+Suite result: ok. 5 passed; 0 failed; 0 skipped; [ELAPSED]
+...
+"#]]);
+}

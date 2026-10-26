@@ -1273,6 +1273,9 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
             merge_child_state(ecx.journal_mut().evm_state_mut(), res.state, restored_snapshot);
         } else {
             *ecx.journal_mut().evm_state_mut() = res.state;
+            // The entries name accounts of the source fork, which the new state lacks: reverting
+            // one would panic.
+            ecx.db_journal_inner_mut().1.journal.clear();
         }
         #[cfg(feature = "monad")]
         foundry_evm_core::FoundryJournal::restore_reserve_balance(

@@ -1436,3 +1436,100 @@ Ran 1 test suite [ELAPSED]: 0 tests passed, 0 failed, 1 skipped (1 total tests)
 
 "#]]);
 }
+
+// A call that switches fork and then reverts must roll back its writes on the new fork, and must
+// not undo writes the new fork received earlier.
+fn add_select_fork_revert_test(prj: &foundry_test_utils::TestProject, endpoint: &str) {
+    prj.add_test(
+        "SelectForkRevert.t.sol",
+        &r#"
+import "forge-std/Test.sol";
+
+contract SelectForkRevertActor is Test {
+    uint256 public value = 7;
+
+    function set(uint256 v) external {
+        value = v;
+    }
+
+    function select(uint256 fork) external {
+        vm.selectFork(fork);
+    }
+
+    function selectAndRevert(uint256 fork) external {
+        vm.selectFork(fork);
+        value = 9;
+        revert("after switch");
+    }
+}
+
+contract SelectForkRevertTest is Test {
+    SelectForkRevertActor actor;
+    uint256 first;
+    uint256 second;
+
+    function setUp() public {
+        first = vm.createSelectFork("<url>");
+        second = vm.createFork("<url>");
+        actor = new SelectForkRevertActor();
+        vm.makePersistent(address(actor));
+    }
+
+    function warm() internal {
+        // Make the source fork's journal longer than the target's.
+        for (uint256 i; i < 64; ++i) {
+            vm.load(address(0xCAFE), bytes32(i));
+        }
+    }
+
+    function test_rolls_back_writes_after_switch() public {
+        warm();
+        (bool success,) = address(actor).call(abi.encodeCall(actor.selectAndRevert, (second)));
+        assertFalse(success);
+        assertEq(vm.activeFork(), second);
+        assertEq(actor.value(), 7, "write after the switch leaked");
+    }
+
+    function test_keeps_earlier_writes_of_target_fork() public {
+        actor.select(second);
+        warm();
+        actor.set(5);
+        actor.select(first);
+        (bool success,) = address(actor).call(abi.encodeCall(actor.selectAndRevert, (second)));
+        assertFalse(success);
+        assertEq(vm.activeFork(), second);
+        assertEq(actor.value(), 5, "earlier write of the target fork was undone");
+    }
+}
+"#
+        .replace("<url>", endpoint),
+    );
+}
+
+#[forgetest_init]
+async fn select_fork_revert_isolated(prj: _, mut cmd: _) {
+    let (_api, handle) = spawn(NodeConfig::test()).await;
+    add_select_fork_revert_test(&prj, &handle.http_endpoint());
+
+    cmd.env("FOUNDRY_ISOLATE", "true");
+    cmd.args(["test", "--mc", "SelectForkRevertTest"]).assert_success().stdout_eq(str![[r#"
+...
+[PASS] test_keeps_earlier_writes_of_target_fork() ([GAS])
+[PASS] test_rolls_back_writes_after_switch() ([GAS])
+...
+"#]]);
+}
+
+#[forgetest_init]
+async fn select_fork_revert_non_isolated(prj: _, mut cmd: _) {
+    let (_api, handle) = spawn(NodeConfig::test()).await;
+    add_select_fork_revert_test(&prj, &handle.http_endpoint());
+
+    cmd.env("FOUNDRY_ISOLATE", "false");
+    cmd.args(["test", "--mc", "SelectForkRevertTest"]).assert_success().stdout_eq(str![[r#"
+...
+[PASS] test_keeps_earlier_writes_of_target_fork() ([GAS])
+[PASS] test_rolls_back_writes_after_switch() ([GAS])
+...
+"#]]);
+}
